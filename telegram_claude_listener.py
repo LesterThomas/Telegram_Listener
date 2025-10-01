@@ -33,6 +33,7 @@ POLL_INTERVAL = 10  # seconds
 # Telegram API endpoints
 BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 last_update_id = None
+use_continue_flag = True  # Track whether to continue conversation or start fresh
 
 
 def convert_markdown_to_html(text):
@@ -106,18 +107,31 @@ def send_telegram_message(text, parse_mode="auto"):
 
 def run_claude_code(message):
     """Send the message to Claude Code"""
+    global use_continue_flag
+
     try:
         # Change to your markdown folder
         os.chdir(MARKDOWN_FOLDER)
 
         print(f"Running Claude Code with message:\n{message}\n")
-        # Run Claude Code with the message and edit permissions
+
+        # Build command with optional --continue flag
+        cmd = ["cmd", "/c", CLAUDE_CLI_PATH, "--dangerously-skip-permissions"]
+        if use_continue_flag:
+            cmd.append("--continue")
+        cmd.append(message)
+
+        # Run Claude Code with the message, edit permissions, and optionally continue conversation
         result = subprocess.run(
-            ["cmd", "/c", CLAUDE_CLI_PATH, "--dangerously-skip-permissions", message],
+            cmd,
             capture_output=True,
             text=True,
             timeout=300,
         )
+
+        # After first successful run, enable continue flag for subsequent messages
+        if result.returncode == 0:
+            use_continue_flag = True
 
         if result.returncode != 0:
             print(
@@ -160,7 +174,7 @@ def get_updates():
 
 def process_message(message):
     """Process incoming Telegram message"""
-    global last_update_id
+    global last_update_id, use_continue_flag
 
     update_id = message.get("update_id")
     last_update_id = update_id
@@ -174,11 +188,16 @@ def process_message(message):
     if str(chat_id) != CHAT_ID:
         return
 
-    # Skip commands like /start
+    # Handle commands
     if text.startswith("/"):
         if text == "/start":
             send_telegram_message(
                 "🤖 Bot is running! Send me a message to update your markdown files via Claude Code."
+            )
+        elif text == "/newsession":
+            use_continue_flag = False
+            send_telegram_message(
+                "🔄 Starting a new Claude Code session. Next message will begin a fresh conversation."
             )
         return
 
