@@ -13,17 +13,17 @@ import subprocess
 import os
 import sys
 import atexit
+import socket
 from pathlib import Path
 from flask import Flask, request, jsonify
-from pyngrok import ngrok
 
 # Parse command-line arguments
-if len(sys.argv) != 4:
+if len(sys.argv) != 6:
     print(
-        "Usage: python telegram_claude_listener.py <BOT_TOKEN> <CHAT_ID> <MARKDOWN_FOLDER>"
+        "Usage: python telegram_claude_listener.py <BOT_TOKEN> <CHAT_ID> <MARKDOWN_FOLDER> <INSTANCE_ID> <NGROK_URL>"
     )
     print(
-        "Example: python telegram_claude_listener.py 'your_bot_token' 'your_chat_id' 'C:\\path\\to\\markdown\\folder'"
+        "Example: python telegram_claude_listener.py 'your_bot_token' 'your_chat_id' 'C:\\path\\to\\markdown\\folder' 'bot1' 'https://abc123.ngrok.io'"
     )
     sys.exit(1)
 
@@ -31,15 +31,17 @@ if len(sys.argv) != 4:
 BOT_TOKEN = sys.argv[1]
 CHAT_ID = sys.argv[2]
 MARKDOWN_FOLDER = sys.argv[3]
+INSTANCE_ID = sys.argv[4]
+NGROK_URL = sys.argv[5].rstrip("/")  # Remove trailing slash if present
 CLAUDE_CLI_PATH = "claude"  # Use just "claude" if it's in PATH, or try "claude.cmd"
 
 # Telegram API endpoints
 BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 use_continue_flag = True  # Track whether to continue conversation or start fresh
+last_session_date = None  # Track the date of the last session
 
 # Flask app for webhook
 app = Flask(__name__)
-ngrok_tunnel = None
 
 
 def convert_markdown_to_html(text):
@@ -113,19 +115,31 @@ def send_telegram_message(text, parse_mode="auto"):
 
 def run_claude_code(message):
     """Send the message to Claude Code"""
-    global use_continue_flag
+    global use_continue_flag, last_session_date
 
     try:
         # Change to your markdown folder
         os.chdir(MARKDOWN_FOLDER)
 
-        print(f"Running Claude Code with message:\n{message}\n")
+        # Add today's date to the message
+        from datetime import datetime
+
+        today = datetime.now().strftime("%Y-%m-%d")
+        message_with_date = f"{message}\n(Today's date is {today})"
+
+        # Start a new session if it's a new day
+        if last_session_date != today:
+            use_continue_flag = False
+            last_session_date = today
+            print(f"🔄 New day detected ({today}), starting fresh session")
+
+        print(f"Running Claude Code with message:\n{message_with_date}\n")
 
         # Build command with optional --continue flag
         cmd = ["cmd", "/c", CLAUDE_CLI_PATH, "--dangerously-skip-permissions"]
         if use_continue_flag:
             cmd.append("--continue")
-        cmd.append(message)
+        cmd.append(message_with_date)
 
         # Run Claude Code with the message, edit permissions, and optionally continue conversation
         result = subprocess.run(
@@ -231,10 +245,14 @@ def process_message(msg):
         send_telegram_message(result)
 
 
-@app.route("/webhook", methods=["POST"])
-def webhook():
+@app.route(f"/webhook/<instance_id>", methods=["POST"])
+def webhook(instance_id):
     """Handle incoming webhook from Telegram"""
     try:
+        # Verify this is the correct instance
+        if instance_id != INSTANCE_ID:
+            return jsonify({"ok": False, "error": "Invalid instance ID"}), 404
+
         update = request.get_json()
         if update and "message" in update:
             process_message(update["message"])
@@ -244,37 +262,40 @@ def webhook():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+def get_free_port():
+    """Find and return a free port"""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        s.listen(1)
+        port = s.getsockname()[1]
+    return port
+
+
 def cleanup():
-    """Cleanup function to remove webhook and close ngrok tunnel"""
-    global ngrok_tunnel
+    """Cleanup function to remove webhook"""
     print("\n🧹 Cleaning up...")
     delete_webhook()
-    if ngrok_tunnel:
-        ngrok.disconnect(ngrok_tunnel.public_url)
-        print("🔌 ngrok tunnel closed")
 
 
 def main():
     """Main bot entry point with webhook"""
-    global ngrok_tunnel
-
     # Register cleanup handler
     atexit.register(cleanup)
 
     print(f"🤖 Telegram bot started!")
     print(f"📂 Monitoring folder: {MARKDOWN_FOLDER}")
     print(f"💬 Listening for messages from chat ID: {CHAT_ID}")
+    print(f"🆔 Instance ID: {INSTANCE_ID}")
     print("Press Ctrl+C to stop\n")
 
     try:
-        # Start ngrok tunnel
-        print("🔌 Starting ngrok tunnel...")
-        ngrok_tunnel = ngrok.connect(5000, bind_tls=True)
-        public_url = ngrok_tunnel.public_url
-        print(f"🌐 ngrok tunnel URL: {public_url}")
+        # Use static port 5000
+        port = 5000
+        print(f"📡 Using port: {port}")
 
-        # Set webhook
-        webhook_url = f"{public_url}/webhook"
+        # Set webhook using the provided ngrok URL
+        webhook_url = f"{NGROK_URL}/webhook/{INSTANCE_ID}"
+        print(f"🌐 Setting webhook to: {webhook_url}")
         if not set_webhook(webhook_url):
             print("❌ Failed to set webhook. Exiting.")
             return
@@ -285,7 +306,7 @@ def main():
         # Run Flask app
         print("🚀 Starting Flask webhook server...")
         print("Press Ctrl+C to stop\n")
-        app.run(port=5000, debug=False, use_reloader=False)
+        app.run(port=port, debug=False, use_reloader=False)
 
     except KeyboardInterrupt:
         print("\n👋 Bot stopped")
@@ -293,6 +314,7 @@ def main():
     except Exception as e:
         print(f"❌ Error in main: {e}")
         import traceback
+
         traceback.print_exc()
 
 
