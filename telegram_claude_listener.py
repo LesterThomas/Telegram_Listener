@@ -91,8 +91,10 @@ def convert_markdown_to_html(text):
     return text
 
 
-def send_telegram_message(instance_id, text, parse_mode="auto"):
-    """Send a message back to Telegram with markdown formatting"""
+def send_telegram_message(instance_id, text, parse_mode="auto", max_retries=3):
+    """Send a message back to Telegram with markdown formatting and retry logic"""
+    import time
+
     bot_config = bot_instances[instance_id]
     url = f"{bot_config['base_url']}/sendMessage"
 
@@ -116,23 +118,29 @@ def send_telegram_message(instance_id, text, parse_mode="auto"):
         if attempt_parse_mode:
             data["parse_mode"] = attempt_parse_mode
 
-        try:
-            print(
-                f"[{instance_id}] Trying to send message with {attempt_parse_mode or 'plain text'}"
-            )
-            print(f"Message content:\n{attempt_text}\n")
-            response = requests.post(url, data=data)
-            if response.ok:
-                print(f"[{instance_id}] Message sent successfully")
-                return  # Success, exit
-            else:
-                print(
-                    f"[{instance_id}] Failed with {attempt_parse_mode or 'plain text'}: {response.text}"
-                )
-        except Exception as e:
-            print(f"[{instance_id}] Error with {attempt_parse_mode or 'plain text'}: {e}")
+        # Retry logic for network errors
+        for retry in range(max_retries):
+            try:
+                response = requests.post(url, data=data, timeout=10)
+                if response.ok:
+                    return True  # Success, exit
+                else:
+                    # Format error, don't retry - try next format
+                    break  # Break retry loop, try next format
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, ConnectionResetError) as e:
+                if retry < max_retries - 1:
+                    wait_time = 2 ** retry  # Exponential backoff
+                    print(f"[{instance_id}] ⚠️  Network error sending message (attempt {retry + 1}/{max_retries}), retrying...")
+                    time.sleep(wait_time)
+                else:
+                    print(f"[{instance_id}] ❌ Failed to send message after {max_retries} attempts")
+                    break  # Break retry loop, try next format
+            except Exception as e:
+                print(f"[{instance_id}] ❌ Error sending message: {e}")
+                break  # Break retry loop, try next format
 
-    print(f"[{instance_id}] All formatting attempts failed")
+    print(f"[{instance_id}] ❌ Failed to send message (all formats failed)")
+    return False
 
 
 def run_claude_code(instance_id, message):
@@ -152,9 +160,7 @@ def run_claude_code(instance_id, message):
         if bot_state["last_session_date"] != today:
             bot_state["use_continue_flag"] = False
             bot_state["last_session_date"] = today
-            print(f"[{instance_id}] 🔄 New day detected ({today}), starting fresh session")
-
-        print(f"[{instance_id}] Running Claude Code with message:\n{message_with_date}\n")
+            print(f"[{instance_id}] 🔄 Starting new session for {today}")
 
         # Build command with optional --continue flag
         cmd = ["cmd", "/c", "claude", "--dangerously-skip-permissions"]
@@ -175,25 +181,20 @@ def run_claude_code(instance_id, message):
             bot_state["use_continue_flag"] = True
 
         if result.returncode != 0:
-            print(
-                f"[{instance_id}] ❌ Claude Code failed with exit code {result.returncode}\n\nError:\n{result.stderr}\n\nOutput:\n{result.stdout}"
-            )
+            print(f"[{instance_id}] ❌ Claude Code failed with exit code {result.returncode}")
+            print(f"Error: {result.stderr}")
             return None
-        print(
-            f"[{instance_id}] ✅ Claude Code completed successfully.\n\nOutput:\n{result.stdout}"
-        )
+
         return result.stdout
 
     except FileNotFoundError:
-        print(
-            f"[{instance_id}] ❌ Claude CLI not found. Please check if Claude is installed and accessible from PATH."
-        )
+        print(f"[{instance_id}] ❌ Claude CLI not found")
         return None
     except subprocess.TimeoutExpired:
-        print(f"[{instance_id}] ⏱️ Claude Code timed out (took longer than 5 minutes)")
+        print(f"[{instance_id}] ⏱️ Claude Code timed out (>5 minutes)")
         return None
     except Exception as e:
-        print(f"[{instance_id}] Error running Claude Code: {e}")
+        print(f"[{instance_id}] ❌ Error running Claude Code: {e}")
         return None
 
 
@@ -206,8 +207,6 @@ def set_webhook(instance_id, ngrok_url, max_retries=3):
     webhook_url = f"{ngrok_url}/webhook/{instance_id}"
     data = {"url": webhook_url, "allowed_updates": ["message"]}
 
-    print(f"[{instance_id}] Setting webhook to: {webhook_url}")
-
     for attempt in range(max_retries):
         try:
             response = requests.post(
@@ -219,7 +218,6 @@ def set_webhook(instance_id, ngrok_url, max_retries=3):
             response.raise_for_status()
             result = response.json()
             if result.get("ok"):
-                print(f"[{instance_id}] ✅ Webhook set successfully")
                 return True
             else:
                 error_msg = result.get("description", str(result))
@@ -227,71 +225,80 @@ def set_webhook(instance_id, ngrok_url, max_retries=3):
                 return False
         except (requests.exceptions.ConnectionError, ConnectionResetError) as e:
             if attempt < max_retries - 1:
-                wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
-                print(f"[{instance_id}] ⚠️  Connection error (attempt {attempt + 1}/{max_retries}): {e}")
-                print(f"[{instance_id}] Retrying in {wait_time} seconds...")
+                wait_time = 2 ** attempt
+                print(f"[{instance_id}] ⚠️  Connection error, retrying in {wait_time}s...")
                 time.sleep(wait_time)
             else:
-                print(f"[{instance_id}] ❌ Failed after {max_retries} attempts")
-                print(f"[{instance_id}] ⚠️  Check that:")
-                print(f"    1. Your BOT_TOKEN is correct")
-                print(f"    2. Your NGROK_URL is accessible: {ngrok_url}")
-                print(f"    3. ngrok tunnel is running")
+                print(f"[{instance_id}] ❌ Failed to set webhook after {max_retries} attempts")
                 return False
         except requests.exceptions.RequestException as e:
             print(f"[{instance_id}] ❌ Network error setting webhook: {e}")
             return False
         except Exception as e:
-            print(f"[{instance_id}] ❌ Unexpected error setting webhook: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"[{instance_id}] ❌ Error setting webhook: {e}")
             return False
 
     return False
 
 
-def delete_webhook(instance_id):
-    """Remove the Telegram webhook for a bot instance"""
+def delete_webhook(instance_id, max_retries=3):
+    """Remove the Telegram webhook for a bot instance with retry logic"""
+    import time
+
     bot_config = bot_instances[instance_id]
     webhook_url = f"{bot_config['base_url']}/deleteWebhook"
-    try:
-        response = requests.post(webhook_url)
-        response.raise_for_status()
-        result = response.json()
-        if result.get("ok"):
-            print(f"[{instance_id}] ✅ Webhook deleted successfully")
-            return True
-        else:
-            print(f"[{instance_id}] ❌ Failed to delete webhook: {result}")
+
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(webhook_url, timeout=10)
+            response.raise_for_status()
+            result = response.json()
+            if result.get("ok"):
+                return True
+            else:
+                return False
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, ConnectionResetError) as e:
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt
+                time.sleep(wait_time)
+            else:
+                print(f"[{instance_id}] ⚠️  Failed to delete webhook")
+                return False
+        except Exception as e:
+            print(f"[{instance_id}] ⚠️  Error deleting webhook: {e}")
             return False
-    except Exception as e:
-        print(f"[{instance_id}] ❌ Error deleting webhook: {e}")
-        return False
+
+    return False
 
 
-def get_webhook_info(instance_id):
-    """Get current webhook info for debugging"""
+def get_webhook_info(instance_id, max_retries=3):
+    """Get current webhook info for debugging with retry logic"""
+    import time
+
     bot_config = bot_instances[instance_id]
     webhook_url = f"{bot_config['base_url']}/getWebhookInfo"
-    try:
-        response = requests.get(webhook_url, timeout=10)
-        response.raise_for_status()
-        result = response.json()
-        if result.get("ok"):
-            info = result.get("result", {})
-            print(f"[{instance_id}] Webhook Info:")
-            print(f"    URL: {info.get('url', 'Not set')}")
-            print(f"    Pending updates: {info.get('pending_update_count', 0)}")
-            if info.get('last_error_message'):
-                print(f"    Last error: {info.get('last_error_message')}")
-                print(f"    Last error date: {info.get('last_error_date')}")
-            return info
-        else:
-            print(f"[{instance_id}] Failed to get webhook info: {result}")
+
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(webhook_url, timeout=10)
+            response.raise_for_status()
+            result = response.json()
+            if result.get("ok"):
+                return result.get("result", {})
+            else:
+                return None
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, ConnectionResetError) as e:
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt
+                time.sleep(wait_time)
+            else:
+                print(f"[{instance_id}] ⚠️  Failed to get webhook info")
+                return None
+        except Exception as e:
+            print(f"[{instance_id}] ⚠️  Error getting webhook info: {e}")
             return None
-    except Exception as e:
-        print(f"[{instance_id}] Error getting webhook info: {e}")
-        return None
+
+    return None
 
 
 def process_message(instance_id, msg):
@@ -316,16 +323,23 @@ def process_message(instance_id, msg):
             )
         elif text == "/newsession":
             bot_state["use_continue_flag"] = False
+            print(f"[{instance_id}] 🔄 User requested new session")
             send_telegram_message(
                 instance_id,
                 "🔄 Starting a new Claude Code session. Next message will begin a fresh conversation.",
             )
         return
 
+    # Log incoming message
+    print(f"[{instance_id}] 📨 User: {text}")
+
     # Run Claude Code
     result = run_claude_code(instance_id, text)
     if result:
+        print(f"[{instance_id}] 💬 Claude: {result[:100]}..." if len(result) > 100 else f"[{instance_id}] 💬 Claude: {result}")
         send_telegram_message(instance_id, result)
+    else:
+        print(f"[{instance_id}] ❌ No response from Claude Code")
 
 
 @app.route("/", methods=["GET"])
@@ -338,48 +352,29 @@ def health_check():
     }), 200
 
 
-@app.before_request
-def log_request():
-    """Log all incoming requests"""
-    print(f"[REQUEST] {request.method} {request.path} from {request.remote_addr}")
-
-
 @app.route("/webhook/<instance_id>", methods=["POST", "GET", "HEAD"])
 def webhook(instance_id):
     """Handle incoming webhook from Telegram"""
     try:
-        # Log all incoming requests with available instances for debugging
-        print(f"[{instance_id}] Received {request.method} request to /webhook/{instance_id}")
-        print(f"[DEBUG] Available instances: {list(bot_instances.keys())}")
-        print(f"[DEBUG] Instance '{instance_id}' exists: {instance_id in bot_instances}")
-
         # Handle GET/HEAD requests (for testing)
         if request.method in ["GET", "HEAD"]:
             if instance_id in bot_instances:
-                print(f"[{instance_id}] {request.method} request received - webhook endpoint is reachable")
                 return jsonify({"ok": True, "message": "Webhook endpoint is active"}), 200
             else:
-                print(f"[{instance_id}] {request.method} request for unknown instance")
                 return jsonify({"ok": False, "error": "Invalid instance ID"}), 404
 
         # Verify this is a valid instance
         if instance_id not in bot_instances:
-            print(f"[{instance_id}] Invalid instance ID - not in configured instances")
-            available = ", ".join(bot_instances.keys())
-            print(f"[{instance_id}] Available instances: {available}")
             return jsonify({"ok": False, "error": "Invalid instance ID"}), 404
 
         update = request.get_json()
-        print(f"[{instance_id}] Received update: {update}")
 
         if update and "message" in update:
             process_message(instance_id, update["message"])
-        else:
-            print(f"[{instance_id}] No message in update")
 
         return jsonify({"ok": True}), 200
     except Exception as e:
-        print(f"[{instance_id}] Error in webhook handler: {e}")
+        print(f"[{instance_id}] ❌ Error in webhook handler: {e}")
         import traceback
         traceback.print_exc()
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -387,9 +382,11 @@ def webhook(instance_id):
 
 def cleanup():
     """Cleanup function to remove all webhooks"""
-    print("\n🧹 Cleaning up...")
+    print("\n🧹 Shutting down...")
     for instance_id in bot_instances.keys():
+        print(f"  [{instance_id}] Removing webhook")
         delete_webhook(instance_id)
+    print("✅ All webhooks removed")
 
 
 def main():
@@ -415,42 +412,45 @@ def main():
     # Register cleanup handler
     atexit.register(cleanup)
 
-    print(f"🤖 Telegram bot listener started!")
-    print(f"🌐 Ngrok URL: {ngrok_url}")
-    print(f"📊 Loaded {len(bot_instances)} bot instance(s):\n")
+    print("=" * 60)
+    print("🤖 Telegram Claude Listener")
+    print("=" * 60)
+    print(f"\n📊 Loaded {len(bot_instances)} bot instance(s):\n")
 
     for instance_id, config in bot_instances.items():
         print(f"  [{instance_id}]")
-        print(f"    📂 Folder: {config['markdown_folder']}")
+        print(f"    📂 {config['markdown_folder']}")
         print(f"    💬 Chat ID: {config['chat_id']}")
-        print(f"    🔗 Webhook: {ngrok_url}/webhook/{instance_id}\n")
+        print()
 
-    print("Press Ctrl+C to stop\n")
+    print(f"🌐 Webhook base URL: {ngrok_url}")
+    print(f"🔌 Server port: 5000")
+    print("\n" + "=" * 60)
+    print("Starting up...\n")
 
     try:
         # Set webhooks for all instances
-        print("Setting up webhooks...\n")
+        success_count = 0
         for instance_id in bot_instances.keys():
-            if not set_webhook(instance_id, ngrok_url):
-                print(f"❌ Failed to set webhook for {instance_id}. Continuing anyway...")
+            if set_webhook(instance_id, ngrok_url):
+                print(f"  [{instance_id}] ✅ Webhook registered")
+                success_count += 1
+            else:
+                print(f"  [{instance_id}] ❌ Failed to register webhook")
 
-        # Verify webhooks were set correctly
-        print("\nVerifying webhook configuration...\n")
-        for instance_id in bot_instances.keys():
-            get_webhook_info(instance_id)
-            print()
+        print(f"\n✅ {success_count}/{len(bot_instances)} webhooks registered successfully\n")
+        print("=" * 60)
+        print("🚀 Bot is running! Listening for messages...")
+        print("=" * 60)
+        print("\nPress Ctrl+C to stop\n")
 
-        # Run Flask app on port 5000
-        print("🚀 Starting Flask webhook server on port 5000...")
-        print("Press Ctrl+C to stop\n")
         app.run(port=5000, debug=False, use_reloader=False, host='0.0.0.0')
 
     except KeyboardInterrupt:
-        print("\n👋 Bot stopped")
+        print("\n👋 Shutting down gracefully...")
     except Exception as e:
-        print(f"❌ Error in main: {e}")
+        print(f"\n❌ Error: {e}")
         import traceback
-
         traceback.print_exc()
 
 
