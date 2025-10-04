@@ -4,7 +4,7 @@
 # dependencies = [
 #     "requests",
 #     "flask",
-#     "pyngrok",
+#     "python-dotenv",
 # ]
 # ///
 
@@ -13,35 +13,54 @@ import subprocess
 import os
 import sys
 import atexit
-import socket
 from pathlib import Path
 from flask import Flask, request, jsonify
+from dotenv import load_dotenv
+from datetime import datetime
 
-# Parse command-line arguments
-if len(sys.argv) != 6:
-    print(
-        "Usage: python telegram_claude_listener.py <BOT_TOKEN> <CHAT_ID> <MARKDOWN_FOLDER> <INSTANCE_ID> <NGROK_URL>"
-    )
-    print(
-        "Example: python telegram_claude_listener.py 'your_bot_token' 'your_chat_id' 'C:\\path\\to\\markdown\\folder' 'bot1' 'https://abc123.ngrok.io'"
-    )
-    sys.exit(1)
-
-# Configuration from command-line arguments
-BOT_TOKEN = sys.argv[1]
-CHAT_ID = sys.argv[2]
-MARKDOWN_FOLDER = sys.argv[3]
-INSTANCE_ID = sys.argv[4]
-NGROK_URL = sys.argv[5].rstrip("/")  # Remove trailing slash if present
-CLAUDE_CLI_PATH = "claude"  # Use just "claude" if it's in PATH, or try "claude.cmd"
-
-# Telegram API endpoints
-BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
-use_continue_flag = True  # Track whether to continue conversation or start fresh
-last_session_date = None  # Track the date of the last session
+# Load environment variables from .env file
+load_dotenv()
 
 # Flask app for webhook
 app = Flask(__name__)
+
+# Store bot instances configuration
+bot_instances = {}
+# Track conversation state for each bot instance
+bot_states = {}
+
+
+def load_bot_instances():
+    """Load bot instances from environment variables"""
+    instances = {}
+    i = 1
+    while True:
+        prefix = f"BOT{i}_"
+        token = os.getenv(f"{prefix}TOKEN")
+        chat_id = os.getenv(f"{prefix}CHAT_ID")
+        markdown_folder = os.getenv(f"{prefix}MARKDOWN_FOLDER")
+        instance_id = os.getenv(f"{prefix}INSTANCE_ID")
+
+        if not all([token, chat_id, markdown_folder, instance_id]):
+            break
+
+        instances[instance_id] = {
+            "token": token,
+            "chat_id": chat_id,
+            "markdown_folder": markdown_folder,
+            "instance_id": instance_id,
+            "base_url": f"https://api.telegram.org/bot{token}",
+        }
+
+        # Initialize state for this bot
+        bot_states[instance_id] = {
+            "use_continue_flag": True,
+            "last_session_date": None,
+        }
+
+        i += 1
+
+    return instances
 
 
 def convert_markdown_to_html(text):
@@ -72,9 +91,10 @@ def convert_markdown_to_html(text):
     return text
 
 
-def send_telegram_message(text, parse_mode="auto"):
+def send_telegram_message(instance_id, text, parse_mode="auto"):
     """Send a message back to Telegram with markdown formatting"""
-    url = f"{BASE_URL}/sendMessage"
+    bot_config = bot_instances[instance_id]
+    url = f"{bot_config['base_url']}/sendMessage"
 
     # Try different formatting approaches
     attempts = []
@@ -92,52 +112,53 @@ def send_telegram_message(text, parse_mode="auto"):
         attempts.append((parse_mode, text))
 
     for attempt_parse_mode, attempt_text in attempts:
-        data = {"chat_id": CHAT_ID, "text": attempt_text}
+        data = {"chat_id": bot_config["chat_id"], "text": attempt_text}
         if attempt_parse_mode:
             data["parse_mode"] = attempt_parse_mode
 
         try:
-            print(f"Trying to send message with {attempt_parse_mode or 'plain text'}")
+            print(
+                f"[{instance_id}] Trying to send message with {attempt_parse_mode or 'plain text'}"
+            )
             print(f"Message content:\n{attempt_text}\n")
             response = requests.post(url, data=data)
             if response.ok:
-                print("Message sent successfully")
+                print(f"[{instance_id}] Message sent successfully")
                 return  # Success, exit
             else:
                 print(
-                    f"Failed with {attempt_parse_mode or 'plain text'}: {response.text}"
+                    f"[{instance_id}] Failed with {attempt_parse_mode or 'plain text'}: {response.text}"
                 )
         except Exception as e:
-            print(f"Error with {attempt_parse_mode or 'plain text'}: {e}")
+            print(f"[{instance_id}] Error with {attempt_parse_mode or 'plain text'}: {e}")
 
-    print("All formatting attempts failed")
+    print(f"[{instance_id}] All formatting attempts failed")
 
 
-def run_claude_code(message):
+def run_claude_code(instance_id, message):
     """Send the message to Claude Code"""
-    global use_continue_flag, last_session_date
+    bot_config = bot_instances[instance_id]
+    bot_state = bot_states[instance_id]
 
     try:
-        # Change to your markdown folder
-        os.chdir(MARKDOWN_FOLDER)
+        # Change to markdown folder
+        os.chdir(bot_config["markdown_folder"])
 
         # Add today's date to the message
-        from datetime import datetime
-
         today = datetime.now().strftime("%Y-%m-%d")
         message_with_date = f"{message}\n(Today's date is {today})"
 
         # Start a new session if it's a new day
-        if last_session_date != today:
-            use_continue_flag = False
-            last_session_date = today
-            print(f"🔄 New day detected ({today}), starting fresh session")
+        if bot_state["last_session_date"] != today:
+            bot_state["use_continue_flag"] = False
+            bot_state["last_session_date"] = today
+            print(f"[{instance_id}] 🔄 New day detected ({today}), starting fresh session")
 
-        print(f"Running Claude Code with message:\n{message_with_date}\n")
+        print(f"[{instance_id}] Running Claude Code with message:\n{message_with_date}\n")
 
         # Build command with optional --continue flag
-        cmd = ["cmd", "/c", CLAUDE_CLI_PATH, "--dangerously-skip-permissions"]
-        if use_continue_flag:
+        cmd = ["cmd", "/c", "claude", "--dangerously-skip-permissions"]
+        if bot_state["use_continue_flag"]:
             cmd.append("--continue")
         cmd.append(message_with_date)
 
@@ -151,166 +172,281 @@ def run_claude_code(message):
 
         # After first successful run, enable continue flag for subsequent messages
         if result.returncode == 0:
-            use_continue_flag = True
+            bot_state["use_continue_flag"] = True
 
         if result.returncode != 0:
             print(
-                f"❌ Claude Code failed with exit code {result.returncode}\n\nError:\n{result.stderr}\n\nOutput:\n{result.stdout}"
+                f"[{instance_id}] ❌ Claude Code failed with exit code {result.returncode}\n\nError:\n{result.stderr}\n\nOutput:\n{result.stdout}"
             )
             return None
-        print(f"✅ Claude Code completed successfully.\n\nOutput:\n{result.stdout}")
+        print(
+            f"[{instance_id}] ✅ Claude Code completed successfully.\n\nOutput:\n{result.stdout}"
+        )
         return result.stdout
 
     except FileNotFoundError:
         print(
-            "❌ Claude CLI not found. Please check if Claude is installed and accessible from PATH, or update CLAUDE_CLI_PATH in the script."
+            f"[{instance_id}] ❌ Claude CLI not found. Please check if Claude is installed and accessible from PATH."
         )
         return None
     except subprocess.TimeoutExpired:
-        print("⏱️ Claude Code timed out (took longer than 5 minutes)")
+        print(f"[{instance_id}] ⏱️ Claude Code timed out (took longer than 5 minutes)")
         return None
     except Exception as e:
-        print(f"Error running Claude Code: {e}")
+        print(f"[{instance_id}] Error running Claude Code: {e}")
         return None
 
 
-def set_webhook(url):
-    """Set the Telegram webhook"""
-    webhook_url = f"{BASE_URL}/setWebhook"
-    data = {"url": url, "allowed_updates": ["message"]}
-    try:
-        response = requests.post(webhook_url, json=data)
-        response.raise_for_status()
-        result = response.json()
-        if result.get("ok"):
-            print(f"✅ Webhook set successfully to: {url}")
-            return True
-        else:
-            print(f"❌ Failed to set webhook: {result}")
+def set_webhook(instance_id, ngrok_url, max_retries=3):
+    """Set the Telegram webhook for a bot instance with retry logic"""
+    import time
+
+    bot_config = bot_instances[instance_id]
+    webhook_api_url = f"{bot_config['base_url']}/setWebhook"
+    webhook_url = f"{ngrok_url}/webhook/{instance_id}"
+    data = {"url": webhook_url, "allowed_updates": ["message"]}
+
+    print(f"[{instance_id}] Setting webhook to: {webhook_url}")
+
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(
+                webhook_api_url,
+                json=data,
+                timeout=10,
+                headers={'Connection': 'close'}
+            )
+            response.raise_for_status()
+            result = response.json()
+            if result.get("ok"):
+                print(f"[{instance_id}] ✅ Webhook set successfully")
+                return True
+            else:
+                error_msg = result.get("description", str(result))
+                print(f"[{instance_id}] ❌ Failed to set webhook: {error_msg}")
+                return False
+        except (requests.exceptions.ConnectionError, ConnectionResetError) as e:
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
+                print(f"[{instance_id}] ⚠️  Connection error (attempt {attempt + 1}/{max_retries}): {e}")
+                print(f"[{instance_id}] Retrying in {wait_time} seconds...")
+                time.sleep(wait_time)
+            else:
+                print(f"[{instance_id}] ❌ Failed after {max_retries} attempts")
+                print(f"[{instance_id}] ⚠️  Check that:")
+                print(f"    1. Your BOT_TOKEN is correct")
+                print(f"    2. Your NGROK_URL is accessible: {ngrok_url}")
+                print(f"    3. ngrok tunnel is running")
+                return False
+        except requests.exceptions.RequestException as e:
+            print(f"[{instance_id}] ❌ Network error setting webhook: {e}")
             return False
-    except Exception as e:
-        print(f"❌ Error setting webhook: {e}")
-        return False
+        except Exception as e:
+            print(f"[{instance_id}] ❌ Unexpected error setting webhook: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    return False
 
 
-def delete_webhook():
-    """Remove the Telegram webhook"""
-    webhook_url = f"{BASE_URL}/deleteWebhook"
+def delete_webhook(instance_id):
+    """Remove the Telegram webhook for a bot instance"""
+    bot_config = bot_instances[instance_id]
+    webhook_url = f"{bot_config['base_url']}/deleteWebhook"
     try:
         response = requests.post(webhook_url)
         response.raise_for_status()
         result = response.json()
         if result.get("ok"):
-            print("✅ Webhook deleted successfully")
+            print(f"[{instance_id}] ✅ Webhook deleted successfully")
             return True
         else:
-            print(f"❌ Failed to delete webhook: {result}")
+            print(f"[{instance_id}] ❌ Failed to delete webhook: {result}")
             return False
     except Exception as e:
-        print(f"❌ Error deleting webhook: {e}")
+        print(f"[{instance_id}] ❌ Error deleting webhook: {e}")
         return False
 
 
-def process_message(msg):
-    """Process incoming Telegram message"""
-    global use_continue_flag
+def get_webhook_info(instance_id):
+    """Get current webhook info for debugging"""
+    bot_config = bot_instances[instance_id]
+    webhook_url = f"{bot_config['base_url']}/getWebhookInfo"
+    try:
+        response = requests.get(webhook_url, timeout=10)
+        response.raise_for_status()
+        result = response.json()
+        if result.get("ok"):
+            info = result.get("result", {})
+            print(f"[{instance_id}] Webhook Info:")
+            print(f"    URL: {info.get('url', 'Not set')}")
+            print(f"    Pending updates: {info.get('pending_update_count', 0)}")
+            if info.get('last_error_message'):
+                print(f"    Last error: {info.get('last_error_message')}")
+                print(f"    Last error date: {info.get('last_error_date')}")
+            return info
+        else:
+            print(f"[{instance_id}] Failed to get webhook info: {result}")
+            return None
+    except Exception as e:
+        print(f"[{instance_id}] Error getting webhook info: {e}")
+        return None
+
+
+def process_message(instance_id, msg):
+    """Process incoming Telegram message for a specific bot instance"""
+    bot_config = bot_instances[instance_id]
+    bot_state = bot_states[instance_id]
 
     # Extract message details
     chat_id = msg.get("chat", {}).get("id")
     text = msg.get("text", "")
 
-    # Only process messages from your chat
-    if str(chat_id) != CHAT_ID:
+    # Only process messages from the configured chat
+    if str(chat_id) != bot_config["chat_id"]:
         return
 
     # Handle commands
     if text.startswith("/"):
         if text == "/start":
             send_telegram_message(
-                "🤖 Bot is running! Send me a message to update your markdown files via Claude Code."
+                instance_id,
+                "🤖 Bot is running! Send me a message to update your markdown files via Claude Code.",
             )
         elif text == "/newsession":
-            use_continue_flag = False
+            bot_state["use_continue_flag"] = False
             send_telegram_message(
-                "🔄 Starting a new Claude Code session. Next message will begin a fresh conversation."
+                instance_id,
+                "🔄 Starting a new Claude Code session. Next message will begin a fresh conversation.",
             )
         return
 
-    # print(f"Received message: {text}")
-    # send_telegram_message("⏳ Processing your request with Claude Code...")
-
     # Run Claude Code
-    result = run_claude_code(text)
+    result = run_claude_code(instance_id, text)
     if result:
-        send_telegram_message(result)
+        send_telegram_message(instance_id, result)
 
 
-@app.route(f"/webhook/<instance_id>", methods=["POST"])
+@app.route("/", methods=["GET"])
+def health_check():
+    """Health check endpoint"""
+    return jsonify({
+        "ok": True,
+        "message": "Telegram Claude Listener is running",
+        "instances": list(bot_instances.keys())
+    }), 200
+
+
+@app.before_request
+def log_request():
+    """Log all incoming requests"""
+    print(f"[REQUEST] {request.method} {request.path} from {request.remote_addr}")
+
+
+@app.route("/webhook/<instance_id>", methods=["POST", "GET", "HEAD"])
 def webhook(instance_id):
     """Handle incoming webhook from Telegram"""
     try:
-        # Verify this is the correct instance
-        if instance_id != INSTANCE_ID:
+        # Log all incoming requests with available instances for debugging
+        print(f"[{instance_id}] Received {request.method} request to /webhook/{instance_id}")
+        print(f"[DEBUG] Available instances: {list(bot_instances.keys())}")
+        print(f"[DEBUG] Instance '{instance_id}' exists: {instance_id in bot_instances}")
+
+        # Handle GET/HEAD requests (for testing)
+        if request.method in ["GET", "HEAD"]:
+            if instance_id in bot_instances:
+                print(f"[{instance_id}] {request.method} request received - webhook endpoint is reachable")
+                return jsonify({"ok": True, "message": "Webhook endpoint is active"}), 200
+            else:
+                print(f"[{instance_id}] {request.method} request for unknown instance")
+                return jsonify({"ok": False, "error": "Invalid instance ID"}), 404
+
+        # Verify this is a valid instance
+        if instance_id not in bot_instances:
+            print(f"[{instance_id}] Invalid instance ID - not in configured instances")
+            available = ", ".join(bot_instances.keys())
+            print(f"[{instance_id}] Available instances: {available}")
             return jsonify({"ok": False, "error": "Invalid instance ID"}), 404
 
         update = request.get_json()
+        print(f"[{instance_id}] Received update: {update}")
+
         if update and "message" in update:
-            process_message(update["message"])
+            process_message(instance_id, update["message"])
+        else:
+            print(f"[{instance_id}] No message in update")
+
         return jsonify({"ok": True}), 200
     except Exception as e:
-        print(f"Error in webhook handler: {e}")
+        print(f"[{instance_id}] Error in webhook handler: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
-def get_free_port():
-    """Find and return a free port"""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))
-        s.listen(1)
-        port = s.getsockname()[1]
-    return port
-
-
 def cleanup():
-    """Cleanup function to remove webhook"""
+    """Cleanup function to remove all webhooks"""
     print("\n🧹 Cleaning up...")
-    delete_webhook()
+    for instance_id in bot_instances.keys():
+        delete_webhook(instance_id)
 
 
 def main():
     """Main bot entry point with webhook"""
+    global bot_instances
+
+    # Load bot instances from .env
+    bot_instances = load_bot_instances()
+
+    if not bot_instances:
+        print("❌ No bot instances found in .env file!")
+        print("Please create a .env file based on .env.example")
+        sys.exit(1)
+
+    # Get ngrok URL from environment
+    ngrok_url = os.getenv("NGROK_URL")
+    if not ngrok_url:
+        print("❌ NGROK_URL not found in .env file!")
+        sys.exit(1)
+
+    ngrok_url = ngrok_url.rstrip("/")
+
     # Register cleanup handler
     atexit.register(cleanup)
 
-    print(f"🤖 Telegram bot started!")
-    print(f"📂 Monitoring folder: {MARKDOWN_FOLDER}")
-    print(f"💬 Listening for messages from chat ID: {CHAT_ID}")
-    print(f"🆔 Instance ID: {INSTANCE_ID}")
+    print(f"🤖 Telegram bot listener started!")
+    print(f"🌐 Ngrok URL: {ngrok_url}")
+    print(f"📊 Loaded {len(bot_instances)} bot instance(s):\n")
+
+    for instance_id, config in bot_instances.items():
+        print(f"  [{instance_id}]")
+        print(f"    📂 Folder: {config['markdown_folder']}")
+        print(f"    💬 Chat ID: {config['chat_id']}")
+        print(f"    🔗 Webhook: {ngrok_url}/webhook/{instance_id}\n")
+
     print("Press Ctrl+C to stop\n")
 
     try:
-        # Use static port 5000
-        port = 5000
-        print(f"📡 Using port: {port}")
+        # Set webhooks for all instances
+        print("Setting up webhooks...\n")
+        for instance_id in bot_instances.keys():
+            if not set_webhook(instance_id, ngrok_url):
+                print(f"❌ Failed to set webhook for {instance_id}. Continuing anyway...")
 
-        # Set webhook using the provided ngrok URL
-        webhook_url = f"{NGROK_URL}/webhook/{INSTANCE_ID}"
-        print(f"🌐 Setting webhook to: {webhook_url}")
-        if not set_webhook(webhook_url):
-            print("❌ Failed to set webhook. Exiting.")
-            return
+        # Verify webhooks were set correctly
+        print("\nVerifying webhook configuration...\n")
+        for instance_id in bot_instances.keys():
+            get_webhook_info(instance_id)
+            print()
 
-        # Send startup notification
-        # send_telegram_message("🚀 Claude Code bot is now running!")
-
-        # Run Flask app
-        print("🚀 Starting Flask webhook server...")
+        # Run Flask app on port 5000
+        print("🚀 Starting Flask webhook server on port 5000...")
         print("Press Ctrl+C to stop\n")
-        app.run(port=port, debug=False, use_reloader=False)
+        app.run(port=5000, debug=False, use_reloader=False, host='0.0.0.0')
 
     except KeyboardInterrupt:
         print("\n👋 Bot stopped")
-        # send_telegram_message("🛑 Bot has been stopped")
     except Exception as e:
         print(f"❌ Error in main: {e}")
         import traceback
