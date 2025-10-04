@@ -3,15 +3,19 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "requests",
+#     "flask",
+#     "pyngrok",
 # ]
 # ///
 
 import requests
-import time
 import subprocess
 import os
 import sys
+import atexit
 from pathlib import Path
+from flask import Flask, request, jsonify
+from pyngrok import ngrok
 
 # Parse command-line arguments
 if len(sys.argv) != 4:
@@ -28,12 +32,14 @@ BOT_TOKEN = sys.argv[1]
 CHAT_ID = sys.argv[2]
 MARKDOWN_FOLDER = sys.argv[3]
 CLAUDE_CLI_PATH = "claude"  # Use just "claude" if it's in PATH, or try "claude.cmd"
-POLL_INTERVAL = 10  # seconds
 
 # Telegram API endpoints
 BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
-last_update_id = None
 use_continue_flag = True  # Track whether to continue conversation or start fresh
+
+# Flask app for webhook
+app = Flask(__name__)
+ngrok_tunnel = None
 
 
 def convert_markdown_to_html(text):
@@ -154,33 +160,48 @@ def run_claude_code(message):
         return None
 
 
-def get_updates():
-    """Poll Telegram for new messages"""
-    global last_update_id
-
-    url = f"{BASE_URL}/getUpdates"
-    params = {"timeout": 30, "allowed_updates": ["message"]}
-
-    if last_update_id:
-        params["offset"] = last_update_id + 1
-
+def set_webhook(url):
+    """Set the Telegram webhook"""
+    webhook_url = f"{BASE_URL}/setWebhook"
+    data = {"url": url, "allowed_updates": ["message"]}
     try:
-        response = requests.get(url, params=params, timeout=35)
-        return response.json()
+        response = requests.post(webhook_url, json=data)
+        response.raise_for_status()
+        result = response.json()
+        if result.get("ok"):
+            print(f"✅ Webhook set successfully to: {url}")
+            return True
+        else:
+            print(f"❌ Failed to set webhook: {result}")
+            return False
     except Exception as e:
-        print(f"Error getting updates: {e}")
-        return None
+        print(f"❌ Error setting webhook: {e}")
+        return False
 
 
-def process_message(message):
+def delete_webhook():
+    """Remove the Telegram webhook"""
+    webhook_url = f"{BASE_URL}/deleteWebhook"
+    try:
+        response = requests.post(webhook_url)
+        response.raise_for_status()
+        result = response.json()
+        if result.get("ok"):
+            print("✅ Webhook deleted successfully")
+            return True
+        else:
+            print(f"❌ Failed to delete webhook: {result}")
+            return False
+    except Exception as e:
+        print(f"❌ Error deleting webhook: {e}")
+        return False
+
+
+def process_message(msg):
     """Process incoming Telegram message"""
-    global last_update_id, use_continue_flag
-
-    update_id = message.get("update_id")
-    last_update_id = update_id
+    global use_continue_flag
 
     # Extract message details
-    msg = message.get("message", {})
     chat_id = msg.get("chat", {}).get("id")
     text = msg.get("text", "")
 
@@ -210,33 +231,69 @@ def process_message(message):
         send_telegram_message(result)
 
 
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    """Handle incoming webhook from Telegram"""
+    try:
+        update = request.get_json()
+        if update and "message" in update:
+            process_message(update["message"])
+        return jsonify({"ok": True}), 200
+    except Exception as e:
+        print(f"Error in webhook handler: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+def cleanup():
+    """Cleanup function to remove webhook and close ngrok tunnel"""
+    global ngrok_tunnel
+    print("\n🧹 Cleaning up...")
+    delete_webhook()
+    if ngrok_tunnel:
+        ngrok.disconnect(ngrok_tunnel.public_url)
+        print("🔌 ngrok tunnel closed")
+
+
 def main():
-    """Main bot loop"""
+    """Main bot entry point with webhook"""
+    global ngrok_tunnel
+
+    # Register cleanup handler
+    atexit.register(cleanup)
+
     print(f"🤖 Telegram bot started!")
     print(f"📂 Monitoring folder: {MARKDOWN_FOLDER}")
     print(f"💬 Listening for messages from chat ID: {CHAT_ID}")
     print("Press Ctrl+C to stop\n")
 
-    # Send startup notification
-    # send_telegram_message("🚀 Claude Code bot is now running!")
+    try:
+        # Start ngrok tunnel
+        print("🔌 Starting ngrok tunnel...")
+        ngrok_tunnel = ngrok.connect(5000, bind_tls=True)
+        public_url = ngrok_tunnel.public_url
+        print(f"🌐 ngrok tunnel URL: {public_url}")
 
-    while True:
-        try:
-            updates = get_updates()
+        # Set webhook
+        webhook_url = f"{public_url}/webhook"
+        if not set_webhook(webhook_url):
+            print("❌ Failed to set webhook. Exiting.")
+            return
 
-            if updates and updates.get("ok"):
-                for update in updates.get("result", []):
-                    process_message(update)
+        # Send startup notification
+        # send_telegram_message("🚀 Claude Code bot is now running!")
 
-            time.sleep(POLL_INTERVAL)
+        # Run Flask app
+        print("🚀 Starting Flask webhook server...")
+        print("Press Ctrl+C to stop\n")
+        app.run(port=5000, debug=False, use_reloader=False)
 
-        except KeyboardInterrupt:
-            print("\n👋 Bot stopped")
-            # send_telegram_message("🛑 Bot has been stopped")
-            break
-        except Exception as e:
-            print(f"Error in main loop: {e}")
-            time.sleep(5)
+    except KeyboardInterrupt:
+        print("\n👋 Bot stopped")
+        # send_telegram_message("🛑 Bot has been stopped")
+    except Exception as e:
+        print(f"❌ Error in main: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 if __name__ == "__main__":
